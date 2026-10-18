@@ -61,6 +61,8 @@ Sidebar markers are shortcuts: clicking one starts the engine and adds it to the
 
 Clients load project configuration differently: Cursor and Devin ask you to enable or trust project MCP servers, and Devin looks for `.devin/mcp_config.json` at the Git repository root. Tools disabled in Settings become a disabled list for Codex and Devin, an allowlist of the remaining tools for Cursor (after the tool list has been fetched once), and deny rules in `.claude/settings.json` for Claude Code.
 
+REA runs inside each client, which manages analysis sessions itself through `open_binary` / `close_binary`. **REA sessions** on the REA overview lists the process trees clients started with `rea-agents … mcp`: client, PID, start time, process count and memory including Ghidra and other providers. **End** (after confirmation) ends a whole tree; that client must reload MCP to use REA again. **Clean up** ends only trees whose client has exited and deletes `rea-*` folders in the system temporary directory that are older than every running session. Other processes, including `rea doctor`, are never listed or ended.
+
 When CodeGraph starts for a project without an index, the desktop first runs `codegraph init --yes` and then starts it; the operation can be cancelled. This applies to manual starts, one-click activation, **Start all CodeGraph** and resuming after a restart. Sync and rebuild on the **Code index** card are unchanged.
 
 ## Serena (optional)

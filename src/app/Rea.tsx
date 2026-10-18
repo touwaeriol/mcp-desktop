@@ -29,6 +29,7 @@ import {
 } from "./EngineOverview";
 import { EngineTools } from "./EngineTools";
 import { ReaTools } from "./ReaTools";
+import { ReaSessionsCard } from "./ReaSessions";
 
 export const REA_COMMAND = "npx -y rea-agents@6.5.0 mcp";
 
@@ -109,6 +110,7 @@ export function ReaPanel({
         </CardContent>
       </Card>
       <EngineConnectionCard name="REA" configure={configure} />
+      <ReaSessionsCard />
     </div>
   );
 }

@@ -223,6 +223,32 @@ pre,
 .engine-tools {
   margin-top: 14px;
 }
+.rea-sessions {
+  display: grid;
+  gap: 8px;
+}
+.rea-sessions li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+}
+.rea-sessions strong {
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+}
+.rea-sessions small {
+  display: block;
+  margin-top: 4px;
+  color: #5d6876;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .rea-tools {
   display: grid;
   gap: 10px;

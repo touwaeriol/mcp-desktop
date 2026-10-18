@@ -9,6 +9,7 @@ mod lifecycle;
 mod models;
 mod persistence;
 mod rea;
+mod rea_sessions;
 mod rea_tools;
 mod resume;
 mod runtime;
@@ -628,6 +629,9 @@ pub fn run() {
             rea_tools::cancel_rea_tool_install,
             rea_tools::open_rea_tools_directory,
             rea_tools::adopt_rea_tools,
+            rea_sessions::list_rea_sessions,
+            rea_sessions::end_rea_session,
+            rea_sessions::clean_rea_sessions,
             tools::get_engine_tools,
             tools::refresh_engine_tools,
             tools::save_disabled_tools,

@@ -109,6 +109,29 @@ export interface SerenaSnapshot {
 }
 export type WarpGrepSnapshot = SerenaSnapshot;
 export type ReaEnvironment = Record<string, string>;
+/** A REA process tree an MCP client launched. */
+export interface ReaSession {
+  pid: number;
+  /** The client that launched it; null once that client has exited. */
+  client: string | null;
+  clientPid: number | null;
+  /** Seconds since the Unix epoch. */
+  startedAt: number;
+  /** Resident bytes of the whole tree, including analysis providers. */
+  memory: number;
+  processes: number;
+  orphan: boolean;
+}
+export interface ReaSessions {
+  sessions: ReaSession[];
+  /** Stale `rea-*` temporary folders cleanup would remove. */
+  leftovers: number;
+}
+export interface ReaCleaned {
+  ended: number;
+  removed: number;
+  failed: string[];
+}
 export interface ReaEnvironmentSaved {
   environment: ReaEnvironment;
   updated: string[];

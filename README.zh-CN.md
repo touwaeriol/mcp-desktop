@@ -117,6 +117,8 @@ Morph API Key 保存在仅当前用户可访问的应用数据目录中的应用
 
 REA 的客户端进程不受桌面的“全部停止”和退出操作影响。项目级配置决定哪些客户端项目发现 REA，不限制工具的文件访问范围。JavaScript / Electron 与 .NET 静态分析无需原生反编译器；深度原生分析需按 [REA 官方文档](https://github.com/morluto/rea) 配置 Hopper、Ghidra 或 IDA 等工具及许可证。配套技能可按官方说明另行安装；本应用只注册 MCP，不执行 REA 的全局 `setup`。
 
+REA 概览页的 **REA 会话** 列出本机由客户端以 `rea-agents … mcp` 启动的进程树：所属客户端、PID、启动时间、进程数和包括 Ghidra 等分析引擎在内的内存。分析会话由客户端通过 `open_binary` / `close_binary` 自行管理，桌面无法进入客户端的 stdio 连接关闭单个会话；**结束** 会在确认后结束整棵进程树，该客户端需重新加载 MCP 才能再使用 REA。**清理残留** 只结束客户端已退出的 REA 进程树，并删除系统临时目录中早于所有仍在运行会话的 `rea-*` 文件夹。不匹配 `rea-agents` 与 `mcp` 的进程（包括 `rea doctor`）不会被列出或结束。
+
 REA 配置使用已有的预览、合并、备份、回滚和受管条目移除流程，只修改项目的 `.codex/config.toml` / `.mcp.json`。手动更换 REA 的启动命令或参数后，该条目不再视为当前受管配置。
 
 ## 本地开发

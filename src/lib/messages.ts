@@ -584,5 +584,27 @@ export const english = {
     "{0} is installed and saved to the REA environment; {1} project configurations updated. Reload MCP in the client",
   "{0} 已安装并写入 REA 环境":
     "{0} is installed and saved to the REA environment",
+  "REA 会话": "REA sessions",
+  "本机由客户端启动的 REA 进程。分析会话由客户端通过 open_binary / close_binary 管理；结束进程会同时结束它启动的 Ghidra 等分析引擎，对应客户端需重新加载 MCP。":
+    "REA processes that clients started on this machine. Clients manage analysis sessions themselves with open_binary / close_binary. Ending a process also ends Ghidra and the other engines it started, and that client must reload MCP.",
+  刷新: "Refresh",
+  "结束客户端已退出的 REA 进程，删除早于所有运行中会话的 rea-* 临时目录":
+    "Ends REA processes whose client has exited and deletes rea-* temporary folders older than every running session",
+  "清理残留（{0} 个进程、{1} 个临时目录）":
+    "Clean up ({0} processes, {1} temporary folders)",
+  "正在读取…": "Loading…",
+  "当前没有运行中的 REA 进程": "No REA processes are running",
+  客户端已退出: "Client exited",
+  残留: "Leftover",
+  "PID {0} · 启动于 {1} · {2} 个进程 · {3} MB":
+    "PID {0} · started {1} · {2} processes · {3} MB",
+  结束: "End",
+  确认结束: "Confirm end",
+  "已结束 REA 进程；{0} 需要重新加载 MCP 才能再使用 REA":
+    "REA process ended; reload MCP in {0} to use REA again",
+  "已结束 REA 进程": "REA process ended",
+  "已结束 {0} 个残留 REA 进程，删除 {1} 个临时目录":
+    "Ended {0} leftover REA processes and deleted {1} temporary folders",
+  "以下项目未能清理：{0}": "Could not clean up: {0}",
 } as const;
 export type MessageKey = keyof typeof english;

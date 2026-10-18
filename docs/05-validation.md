@@ -2,6 +2,13 @@
 
 日期：2026-10-03。本文件区分已运行检查和仍待完成的发布验收；设计文档中的性能预算不视为测量结果。
 
+## 未发布：REA 会话管理（2026-10-17）
+
+- REA 概览页新增“REA 会话”：按命令行同时包含 `rea-agents` 与独立参数 `mcp` 识别客户端启动的 REA，npx 经 `cmd /c rea mcp` 二次启动的进程并入同一棵树；父进程只在启动时间不晚于子进程时成立，避免 Windows 进程号复用误归属。客户端取第一个非 Shell / 非 REA 的祖先进程，找不到即视为客户端已退出。
+- “结束”按 PID 与启动时间核对后结束整棵进程树（先子后父，单个失败不中断其余）；“清理残留”只结束客户端已退出的树，并删除系统临时目录（macOS 另含 `/tmp`）中创建时间早于所有仍在运行会话的 `rea-*` 目录，不删除同名文件。
+- Rust 测试覆盖真实 Windows 启动链（`codex → cmd → npx → cmd /c rea mcp → node rea.mjs → java`）的归属与计数、进程号复用、`rea doctor` 与无关 `mcp` 进程排除、残留判定，并实际启动一棵替身进程树（带子进程的 `node … rea-agents-test mcp`）验证错误启动时间被拒绝、结束后子进程同时退出。本机只读列出两个真实 Codex REA 会话（各 5 个进程，约 380 MB），未结束真实会话。
+- 浏览器模拟 IPC 新增 `rea-sessions.cjs`（中英文）：列表、残留标记、确认与取消、结束失败提示、结束后提示重新加载 MCP、清理结果与部分失败提示。`rea-settings`、`activation`、`engine-tools`、`serena`、`config-preview`、`environment-detection` 回归通过。真实桌面中结束客户端 REA 后客户端的表现尚待验收。
+
 ## 0.1.30 Cursor 与 Devin 客户端、按客户端开关（2026-10-17）
 
 - 客户端扩展为 Codex、Claude Code、Cursor（`.cursor/mcp.json`）和 Devin（`.devin/mcp_config.json`）。Cursor 条目不写传输类型，由 `command` / `url` 推断；Devin 条目写 `transport`，校验时兼容 Windsurf 的 `serverUrl`。格式依据本机 Cursor 3.25.6 与 Devin 1.126.0（CLI 3000.10.67）安装包内的配置结构确认。
