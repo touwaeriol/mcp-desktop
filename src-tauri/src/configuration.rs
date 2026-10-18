@@ -156,11 +156,13 @@ pub struct ConfigFile {
     #[serde(skip)]
     pub restore_bytes: Option<Option<Vec<u8>>>,
 }
+/// Fingerprints each service owns, by client; `None` releases the entry.
+pub type Ownership = HashMap<String, HashMap<String, Option<String>>>;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPreview {
     #[serde(skip)]
-    pub ownership: HashMap<String, HashMap<String, Option<String>>>,
+    pub ownership: Ownership,
     #[serde(skip)]
     pub validated_root: Option<String>,
     pub preview_id: String,
@@ -198,6 +200,10 @@ struct Backup {
     service_name: String,
     state: String,
     files: Vec<BackupFile>,
+    /// Ownership the operation records once it succeeds, so an interrupted
+    /// operation's written entries can still be adopted at the next start.
+    #[serde(default)]
+    ownership: Ownership,
 }
 #[derive(Serialize, Deserialize)]
 struct BackupFile {
@@ -266,7 +272,7 @@ fn merge(
             ));
         }
         let existing = doc.get("mcp_servers").and_then(|v| v.get(name));
-        let old_hash = existing.map(|v| hash(v.to_string().as_bytes()));
+        let old_hash = existing.map(toml_fingerprint);
         let conflict = existing.is_some();
         if remove {
             if let Some(t) = doc.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
@@ -411,9 +417,7 @@ pub fn entry_fingerprint(content: &str, client: &str, name: &str) -> Result<Opti
             let servers = servers.as_table_like().ok_or_else(|| {
                 AppError::new("CONFIG_PARSE_FAILED", "mcp_servers 必须是 TOML 表")
             })?;
-            Ok(servers
-                .get(name)
-                .map(|item| hash(item.to_string().as_bytes())))
+            Ok(servers.get(name).map(toml_fingerprint))
         }
         c if is_json(c) => {
             let doc: serde_json::Value = if content.trim().is_empty() {
@@ -441,6 +445,44 @@ pub fn entry_fingerprint(content: &str, client: &str, name: &str) -> Result<Opti
         }
         _ => Err(invalid_client()),
     }
+}
+/// Hashes a Codex entry by its data, sub-tables such as `env` and
+/// `http_headers` included, regardless of how the TOML is laid out.
+fn toml_fingerprint(entry: &toml_edit::Item) -> String {
+    fn value(v: &toml_edit::Value) -> serde_json::Value {
+        use toml_edit::Value::*;
+        match v {
+            String(s) => s.value().as_str().into(),
+            Integer(i) => (*i.value()).into(),
+            Float(f) => serde_json::json!(f.value()),
+            Boolean(b) => (*b.value()).into(),
+            Datetime(d) => d.value().to_string().into(),
+            Array(a) => a.iter().map(value).collect(),
+            InlineTable(t) => t.iter().map(|(k, v)| (k.to_owned(), value(v))).collect(),
+        }
+    }
+    fn table(t: &toml_edit::Table) -> serde_json::Value {
+        t.iter().map(|(k, v)| (k.to_owned(), item(v))).collect()
+    }
+    fn item(i: &toml_edit::Item) -> serde_json::Value {
+        match i {
+            toml_edit::Item::None => serde_json::Value::Null,
+            toml_edit::Item::Value(v) => value(v),
+            toml_edit::Item::Table(t) => table(t),
+            toml_edit::Item::ArrayOfTables(a) => a.iter().map(table).collect(),
+        }
+    }
+    hash(item(entry).to_string().as_bytes())
+}
+/// Converts a Codex fingerprint stored by an earlier version, which left out
+/// the entry's sub-tables, when it still matches the entry in `content`.
+pub fn upgrade_codex_fingerprint(content: &str, name: &str, stored: &str) -> Option<String> {
+    let doc = content
+        .trim_start_matches('\u{feff}')
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    let entry = doc.get("mcp_servers")?.as_table_like()?.get(name)?;
+    (hash(entry.to_string().as_bytes()) == stored).then(|| toml_fingerprint(entry))
 }
 pub fn preview(
     p: &Project,
@@ -744,6 +786,21 @@ fn restore(path: &Path, bytes: &Option<Vec<u8>>) -> Result<()> {
 pub fn apply(preview: &ConfigPreview, root: &Path, data: &Path) -> Result<ApplyResult> {
     apply_with(preview, root, data, None)
 }
+/// The ownership a successful `preview` leaves, by service and client.
+pub fn ownership_of(preview: &ConfigPreview) -> Ownership {
+    if preview.ownership.is_empty() {
+        HashMap::from([(
+            preview.service_name.clone(),
+            preview
+                .files
+                .iter()
+                .map(|f| (f.client.clone(), f.fingerprint.clone()))
+                .collect(),
+        )])
+    } else {
+        preview.ownership.clone()
+    }
+}
 fn apply_with(
     preview: &ConfigPreview,
     root: &Path,
@@ -774,6 +831,12 @@ fn apply_with(
                 after_hash: desired(f).map(hash).unwrap_or_default(),
             })
             .collect(),
+        // Restores into an earlier project root leave ownership unchanged.
+        ownership: if preview.validated_root.is_none() {
+            ownership_of(preview)
+        } else {
+            Ownership::new()
+        },
     };
     atomic_write(
         &backup.join("manifest.json"),
@@ -1179,11 +1242,27 @@ pub fn preview_restore_many(
         files,
     })
 }
-pub fn mark_interrupted(data: &Path) -> Result<()> {
+/// An entry an operation interrupted by a crash had already put in place.
+pub struct Recovered {
+    pub project_id: String,
+    /// The configuration file, so entries outside the project's current root are skipped.
+    pub path: String,
+    pub service: String,
+    pub client: String,
+    pub fingerprint: Option<String>,
+    /// From a manifest of an earlier version, which did not record ownership:
+    /// it only fills in entries no ownership is recorded for.
+    pub legacy: bool,
+}
+/// Marks operations a crash left pending as interrupted and returns the
+/// entries they had already put in place, including those of operations
+/// earlier versions left interrupted.
+pub fn mark_interrupted(data: &Path) -> Result<Vec<Recovered>> {
     let dir = data.join("backups");
     if !dir.exists() {
-        return Ok(());
+        return Ok(vec![]);
     }
+    let mut recovered = Vec::new();
     for item in std::fs::read_dir(dir)? {
         let path = item?.path().join("manifest.json");
         if !path.is_file() {
@@ -1191,12 +1270,66 @@ pub fn mark_interrupted(data: &Path) -> Result<()> {
         }
         let mut manifest: Backup = serde_json::from_slice(&std::fs::read(&path)?)
             .map_err(|_| AppError::new("BACKUP_CORRUPT", "备份清单格式无效"))?;
-        if manifest.state == "pending" {
+        let pending = manifest.state == "pending";
+        let legacy = manifest.ownership.is_empty() && (pending || manifest.state == "interrupted");
+        if !pending && !legacy {
+            continue;
+        }
+        for file in &manifest.files {
+            let Ok(bytes) = read(Path::new(&file.path)) else {
+                continue;
+            };
+            let Ok(current) = text(&bytes) else {
+                continue;
+            };
+            let found = |service: &str, fingerprint: Option<String>| Recovered {
+                project_id: manifest.project_id.clone(),
+                path: file.path.clone(),
+                service: service.into(),
+                client: file.client.clone(),
+                fingerprint,
+                legacy,
+            };
+            if legacy {
+                // Without recorded ownership, adopt only while the file still
+                // holds exactly what the operation wrote.
+                if bytes.as_deref().map(hash).unwrap_or_default() != file.after_hash {
+                    continue;
+                }
+                let services = if manifest.service_names.is_empty() {
+                    std::slice::from_ref(&manifest.service_name)
+                } else {
+                    &manifest.service_names[..]
+                };
+                for service in services {
+                    if let Ok(Some(fingerprint)) =
+                        entry_fingerprint(&current, &file.client, service)
+                    {
+                        recovered.push(found(service, Some(fingerprint)));
+                    }
+                }
+                continue;
+            }
+            for (service, files) in &manifest.ownership {
+                let Some(fingerprint) = files.get(&file.client) else {
+                    continue;
+                };
+                // Adopt only an entry still in the state the operation intended.
+                if entry_fingerprint(&current, &file.client, service)
+                    .ok()
+                    .as_ref()
+                    == Some(fingerprint)
+                {
+                    recovered.push(found(service, fingerprint.clone()));
+                }
+            }
+        }
+        if pending {
             manifest.state = "interrupted".into();
             atomic_write(&path, &serde_json::to_vec_pretty(&manifest).unwrap())?;
         }
     }
-    Ok(())
+    Ok(recovered)
 }
 #[cfg(test)]
 mod recovery_tests {
@@ -1263,6 +1396,116 @@ mod recovery_tests {
             created_at: now(),
             updated_at: now(),
         }
+    }
+    #[test]
+    fn interrupted_operations_keep_ownership_of_entries_already_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let p = project(dir.path());
+        let rea = crate::rea::binding(Default::default());
+        let clients = vec!["codex".to_string(), "claude".to_string()];
+        let change = preview(&p, &clients, "install", &rea, &HashMap::new()).unwrap();
+        let result = apply(&change, dir.path(), data.path()).unwrap();
+        // A crash between writing the files and recording ownership.
+        let manifest_path = Path::new(&result.backup_path).join("manifest.json");
+        let mut manifest: Backup =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.state = "pending".into();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        // An edit after the crash leaves that client's entry to the user.
+        let codex = dir.path().join(client_path("codex").unwrap());
+        let edited = std::fs::read_to_string(&codex)
+            .unwrap()
+            .replace("tool_timeout_sec = 600", "tool_timeout_sec = 900");
+        std::fs::write(&codex, edited).unwrap();
+
+        let recovered = mark_interrupted(data.path()).unwrap();
+        assert_eq!(recovered.len(), 1);
+        let claude = change.files.iter().find(|f| f.client == "claude").unwrap();
+        assert_eq!(
+            (
+                recovered[0].project_id.as_str(),
+                recovered[0].service.as_str(),
+                recovered[0].client.as_str(),
+                &recovered[0].fingerprint,
+                recovered[0].legacy
+            ),
+            (p.id.as_str(), "rea", "claude", &claude.fingerprint, false)
+        );
+        let manifest: Backup =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.state, "interrupted");
+        assert!(mark_interrupted(data.path()).unwrap().is_empty());
+    }
+    #[test]
+    fn operations_earlier_versions_left_interrupted_are_adopted_while_files_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let p = project(dir.path());
+        let rea = crate::rea::binding(Default::default());
+        let clients = vec!["codex".to_string(), "claude".to_string()];
+        let change = preview(&p, &clients, "install", &rea, &HashMap::new()).unwrap();
+        let result = apply(&change, dir.path(), data.path()).unwrap();
+        // Earlier versions recorded no ownership in the manifest.
+        let manifest_path = Path::new(&result.backup_path).join("manifest.json");
+        let mut manifest: Backup =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.state = "interrupted".into();
+        manifest.ownership.clear();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let codex = dir.path().join(client_path("codex").unwrap());
+        std::fs::write(
+            &codex,
+            std::fs::read_to_string(&codex).unwrap() + "# edited\n",
+        )
+        .unwrap();
+
+        let recovered = mark_interrupted(data.path()).unwrap();
+        assert_eq!(recovered.len(), 1);
+        let claude = change.files.iter().find(|f| f.client == "claude").unwrap();
+        assert_eq!(
+            (
+                recovered[0].service.as_str(),
+                recovered[0].client.as_str(),
+                &recovered[0].fingerprint,
+                recovered[0].legacy
+            ),
+            ("rea", "claude", &claude.fingerprint, true)
+        );
+    }
+    #[test]
+    fn codex_fingerprints_cover_sub_tables_and_upgrade_legacy_values() {
+        let entry = |env: &str| {
+            format!("[mcp_servers.rea]\ncommand = \"npx\"\nargs = [\"mcp\"]\n\n[mcp_servers.rea.env]\n{env}\n")
+        };
+        let original = entry("JAVA_HOME = \"/jdk-21\"");
+        let changed = entry("JAVA_HOME = \"/jdk-17\"");
+        let fingerprint = entry_fingerprint(&original, "codex", "rea").unwrap();
+        assert_ne!(
+            fingerprint,
+            entry_fingerprint(&changed, "codex", "rea").unwrap()
+        );
+        // The layout does not matter, only the data.
+        assert_eq!(
+            fingerprint,
+            entry_fingerprint(
+                "[mcp_servers.rea]\ncommand='npx'\nargs=['mcp']\nenv={JAVA_HOME='/jdk-21'}\n",
+                "codex",
+                "rea"
+            )
+            .unwrap()
+        );
+        let doc = original.parse::<toml_edit::DocumentMut>().unwrap();
+        let legacy = hash(doc["mcp_servers"]["rea"].to_string().as_bytes());
+        assert_eq!(
+            upgrade_codex_fingerprint(&original, "rea", &legacy),
+            fingerprint
+        );
+        assert_eq!(upgrade_codex_fingerprint(&original, "rea", "other"), None);
+        assert_eq!(
+            upgrade_codex_fingerprint(&original, "serena", &legacy),
+            None
+        );
     }
     fn config_file(path: &Path, original: Option<Vec<u8>>, after: &str) -> ConfigFile {
         ConfigFile {

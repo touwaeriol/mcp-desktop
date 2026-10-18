@@ -18,7 +18,7 @@ mod updates;
 mod warpgrep;
 use models::*;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -434,10 +434,15 @@ pub fn run() {
             }
             let data = app.path().app_data_dir()?;
             configuration::private_dir(&data).map_err(|e| std::io::Error::other(e.message))?;
-            configuration::mark_interrupted(&data).map_err(|e| std::io::Error::other(e.message))?;
+            let recovered = configuration::mark_interrupted(&data)
+                .map_err(|e| std::io::Error::other(e.message))?;
             let mut db = persistence::open(&data).map_err(|e| std::io::Error::other(e.message))?;
             i18n::set(&persistence::language(&db).map_err(|e| std::io::Error::other(e.message))?);
+            commands::upgrade_codex_fingerprints(&db)
+                .map_err(|e| std::io::Error::other(e.message))?;
             let migration_notes = http_migration::migrate(&mut db, &data)
+                .map_err(|e| std::io::Error::other(e.message))?;
+            commands::recover_ownership(&mut db, &recovered)
                 .map_err(|e| std::io::Error::other(e.message))?;
             let morph_key =
                 warpgrep::saved_key(&db).map_err(|e| std::io::Error::other(e.message))?;
@@ -465,6 +470,26 @@ pub fn run() {
             for note in migration_notes {
                 eprintln!("HTTP configuration migration: {note}");
             }
+            // Claude Code's deny rules follow its entries, which an interrupted write may have left unsynced.
+            {
+                let state = app.state::<AppState>();
+                let mut synced = HashSet::new();
+                for entry in recovered.iter().filter(|entry| entry.client == "claude") {
+                    if !synced.insert(&entry.project_id) {
+                        continue;
+                    }
+                    if let Err(e) = state
+                        .project(&entry.project_id)
+                        .and_then(|project| tools::sync_claude(&state, &project))
+                    {
+                        eprintln!("Claude Code tool rules: {}", e.message);
+                    }
+                }
+            }
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::refresh_recovered(&handle.state::<AppState>(), &recovered).await;
+            });
             #[cfg(unix)]
             install_shutdown_signals(app.handle().clone());
             if UPDATE_SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {

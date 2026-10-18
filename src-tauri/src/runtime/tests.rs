@@ -40,6 +40,99 @@ async fn update_preparation_stops_owned_processes_and_keeps_resume_intent() {
 }
 
 #[tokio::test]
+async fn codex_fingerprints_from_earlier_versions_keep_ownership() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let toggle = |enabled| {
+        crate::commands::set_mcp_configuration(
+            &fixture.state,
+            project.id.clone(),
+            "codex".into(),
+            "rea".into(),
+            enabled,
+        )
+    };
+    toggle(true).await.unwrap();
+    let path = Path::new(&project.canonical_path).join(".codex/config.toml");
+    let doc = std::fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    // Earlier versions hashed the entry without its sub-tables.
+    let legacy = crate::configuration::hash(doc["mcp_servers"]["rea"].to_string().as_bytes());
+    {
+        let db = fixture.state.db.lock().unwrap();
+        db.execute(
+            "UPDATE managed_config SET fingerprint=?2 WHERE project_id=?1 AND client='rea:codex'",
+            rusqlite::params![project.id, legacy],
+        )
+        .unwrap();
+        crate::commands::upgrade_codex_fingerprints(&db).unwrap();
+    }
+    toggle(false).await.unwrap();
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("[mcp_servers.rea]"));
+}
+
+#[tokio::test]
+async fn entries_left_by_interrupted_operations_of_earlier_versions_are_adopted() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let toggle = |enabled| {
+        crate::commands::set_mcp_configuration(
+            &fixture.state,
+            project.id.clone(),
+            "codex".into(),
+            "rea".into(),
+            enabled,
+        )
+    };
+    let applied = toggle(true).await.unwrap();
+    // An earlier version crashed after writing the entry: no ownership was
+    // recorded, in the database or in the manifest.
+    let manifest = Path::new(&applied.backup_path).join("manifest.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    value["state"] = "interrupted".into();
+    value.as_object_mut().unwrap().remove("ownership");
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM managed_config WHERE project_id=?1 AND client='rea:codex'",
+            [&project.id],
+        )
+        .unwrap();
+    assert!(toggle(false)
+        .await
+        .is_err_and(|error| error.code == "CONFIG_CHANGED"));
+
+    // The REA environment changed while the entry was not owned.
+    persistence::set_setting(
+        &fixture.state.db.lock().unwrap(),
+        "reaEnvironment",
+        r#"{"REA_ANALYSIS_PROVIDER":"ghidra"}"#,
+    )
+    .unwrap();
+
+    let recovered = crate::configuration::mark_interrupted(&fixture.state.data).unwrap();
+    crate::commands::recover_ownership(&mut fixture.state.db.lock().unwrap(), &recovered).unwrap();
+    crate::commands::refresh_recovered(&fixture.state, &recovered).await;
+    let path = Path::new(&project.canonical_path).join(".codex/config.toml");
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("REA_ANALYSIS_PROVIDER = \"ghidra\""));
+    toggle(false).await.unwrap();
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("[mcp_servers.rea]"));
+}
+
+#[tokio::test]
 async fn project_mcp_toggles_serialize_writes_and_track_ownership_per_client() {
     let fixture = Fixture::new();
     let project = fixture.project();

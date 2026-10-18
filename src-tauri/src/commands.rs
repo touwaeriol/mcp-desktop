@@ -462,6 +462,142 @@ fn managed_client(engine: &str, key: &str) -> Option<String> {
         .find(|client| managed_key(engine, client) == key)
         .map(str::to_string)
 }
+fn record_ownership(
+    db: &rusqlite::Connection,
+    project_id: &str,
+    ownership: &configuration::Ownership,
+) -> Result<()> {
+    for (service, files) in ownership {
+        for (client, fingerprint) in files {
+            let key = managed_key(service, client);
+            if let Some(fp) = fingerprint {
+                db.execute("INSERT INTO managed_config(project_id,client,fingerprint) VALUES(?1,?2,?3) ON CONFLICT(project_id,client) DO UPDATE SET fingerprint=excluded.fingerprint",rusqlite::params![project_id,key,fp])?;
+            } else {
+                db.execute(
+                    "DELETE FROM managed_config WHERE project_id=?1 AND client=?2",
+                    rusqlite::params![project_id, key],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+/// Records the ownership of entries that operations interrupted by a crash
+/// had already written, as those operations would have on completion.
+pub(crate) fn recover_ownership(
+    db: &mut rusqlite::Connection,
+    recovered: &[configuration::Recovered],
+) -> Result<()> {
+    let projects = persistence::list(db)?;
+    let tx = db.transaction()?;
+    for entry in recovered {
+        // Entries under an earlier project root are not the project's configuration.
+        if !projects.iter().any(|p| {
+            p.id == entry.project_id
+                && Path::new(&entry.path).starts_with(Path::new(&p.canonical_path))
+        }) {
+            continue;
+        }
+        let key = managed_key(&entry.service, &entry.client);
+        match (&entry.fingerprint, entry.legacy) {
+            (Some(fp), true) => {
+                tx.execute(
+                    "INSERT INTO managed_config(project_id,client,fingerprint) VALUES(?1,?2,?3) ON CONFLICT(project_id,client) DO NOTHING",
+                    rusqlite::params![entry.project_id, key, fp],
+                )?;
+            }
+            (fingerprint, _) => record_ownership(
+                &tx,
+                &entry.project_id,
+                &HashMap::from([(
+                    entry.service.clone(),
+                    HashMap::from([(entry.client.clone(), fingerprint.clone())]),
+                )]),
+            )?,
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+/// Rewrites recovered entries the engine settings have since moved past, as
+/// the settings change would have had their ownership been recorded.
+pub(crate) async fn refresh_recovered(state: &AppState, recovered: &[configuration::Recovered]) {
+    for entry in recovered {
+        if entry.fingerprint.is_none() {
+            continue;
+        }
+        let (Ok(project), Ok(binding)) = (
+            state.project(&entry.project_id),
+            binding_for(state, &entry.project_id, Some(&entry.service)),
+        ) else {
+            continue;
+        };
+        if !configuration::status(&project, &binding)
+            .iter()
+            .any(|status| status.client == entry.client && status.state == "repair")
+        {
+            continue;
+        }
+        let result = set_mcp_configuration(
+            state,
+            entry.project_id.clone(),
+            entry.client.clone(),
+            entry.service.clone(),
+            true,
+        )
+        .await;
+        if let Err(e) = result {
+            eprintln!(
+                "Recovered {} configuration for {}: {}",
+                entry.service, entry.client, e.message
+            );
+        }
+    }
+}
+/// Rewrites Codex fingerprints stored by earlier versions in the current
+/// format, for entries that still match them.
+pub(crate) fn upgrade_codex_fingerprints(db: &rusqlite::Connection) -> Result<()> {
+    for project in persistence::list(db)? {
+        let root = Path::new(&project.canonical_path);
+        let path = root.join(configuration::client_path("codex").unwrap());
+        if configuration::safe_path(root, &path).is_err() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut stmt =
+            db.prepare("SELECT client,fingerprint FROM managed_config WHERE project_id=?1")?;
+        let rows = stmt
+            .query_map([&project.id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (key, stored) in rows {
+            // The CodeGraph key may still own the entry under its legacy name.
+            let names = if key == "codex" {
+                vec![
+                    "codegraph".to_owned(),
+                    format!("codegraph_project_{}", project.id.replace('-', "")),
+                ]
+            } else if let Some(engine) = key.strip_suffix(":codex") {
+                vec![engine.to_owned()]
+            } else {
+                continue;
+            };
+            if let Some(fingerprint) = names
+                .iter()
+                .find_map(|name| configuration::upgrade_codex_fingerprint(&content, name, &stored))
+            {
+                db.execute(
+                    "UPDATE managed_config SET fingerprint=?3 WHERE project_id=?1 AND client=?2",
+                    rusqlite::params![project.id, key, fingerprint],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 #[tauri::command]
 pub fn preview_client_config(
     state: State<AppState>,
@@ -612,31 +748,7 @@ fn apply_config(
     if preview.validated_root.is_none() && succeeded {
         let mut db = state.db.lock().unwrap();
         let tx = db.transaction()?;
-        let ownership = if preview.ownership.is_empty() {
-            HashMap::from([(
-                preview.service_name.clone(),
-                preview
-                    .files
-                    .iter()
-                    .map(|f| (f.client.clone(), f.fingerprint.clone()))
-                    .collect(),
-            )])
-        } else {
-            preview.ownership.clone()
-        };
-        for (service, files) in ownership {
-            for (client, fingerprint) in files {
-                let key = managed_key(&service, &client);
-                if let Some(fp) = &fingerprint {
-                    tx.execute("INSERT INTO managed_config(project_id,client,fingerprint) VALUES(?1,?2,?3) ON CONFLICT(project_id,client) DO UPDATE SET fingerprint=excluded.fingerprint",rusqlite::params![p.id,key,fp])?;
-                } else {
-                    tx.execute(
-                        "DELETE FROM managed_config WHERE project_id=?1 AND client=?2",
-                        rusqlite::params![p.id, key],
-                    )?;
-                }
-            }
-        }
+        record_ownership(&tx, &p.id, &configuration::ownership_of(preview))?;
         tx.commit()?;
     }
     if preview.validated_root.is_none()
