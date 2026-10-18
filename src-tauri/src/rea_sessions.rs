@@ -147,7 +147,9 @@ fn snapshot() -> (System, Vec<Proc>) {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
+        // Linux would otherwise list every thread as a process of its own.
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_cmd(UpdateKind::Always)
             .with_memory(),
     );
