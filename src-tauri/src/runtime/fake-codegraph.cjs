@@ -7,15 +7,9 @@ if (process.argv.includes("init")) {
   process.exit(0);
 }
 if (process.argv.includes("status")) {
-  console.log(JSON.stringify({
-    initialized: true,
-    projectPath: process.cwd(),
-    index: { state: "complete" },
-    fileCount: 1,
-    nodeCount: 1,
-    edgeCount: 0,
-  }));
-  process.exit(0);
+  // A full status can traverse a huge source tree. Startup must never invoke it.
+  fs.writeFileSync("unexpected-status-call", "status invoked");
+  process.exit(1);
 }
 
 const input = readline.createInterface({ input: process.stdin });

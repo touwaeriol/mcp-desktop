@@ -11,6 +11,8 @@ use std::{
 use tauri::Manager;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod index_status;
+
 #[cfg(test)]
 mod tests;
 
@@ -22,63 +24,22 @@ pub async fn status(state: &AppState, p: &Project) -> Result<String> {
         .entry(p.id.clone())
         .or_insert_with(|| RuntimeSnapshot::new(&p.id))
         .index_stats = None;
-    if !Path::new(&p.canonical_path).is_dir() {
-        return Err(AppError::new("PROJECT_MISSING", "项目目录不存在"));
-    }
-    if !Path::new(&p.canonical_path).join(".codegraph").exists() {
-        return Ok("missing".into());
-    }
-    let (_, entry) = commands::entry(state)?;
-    let mut cmd = tokio::process::Command::new(entry.program);
-    cmd.args(entry.prefix_args)
-        .args(["status", "--json"])
-        .arg(&p.canonical_path)
-        .env("CODEGRAPH_NO_DAEMON", "1")
-        .current_dir(&p.canonical_path)
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (child, job) = project_gateway::spawn_owned(&mut cmd)
-        .map_err(|e| AppError::new("PROCESS_JOB_FAILED", e))?;
-    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await;
-    job.terminate_and_wait()
+    // CLI `status` also hashes every source file when its Git stamp is absent.
+    // Startup only needs the persisted readiness marker and index counts.
+    let root = p.canonical_path.clone();
+    let stats = tokio::task::spawn_blocking(move || index_status::read(Path::new(&root)))
         .await
-        .map_err(|e| AppError::new("PROCESS_STOP_FAILED", e))?;
-    let out = output.map_err(|_| AppError::new("INDEX_STATUS_TIMEOUT", "读取索引超时"))??;
-    if !out.status.success() {
-        return Err(AppError::new(
-            "INDEX_STATUS_FAILED",
-            String::from_utf8_lossy(&out.stderr),
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| AppError::new("INDEX_STATUS_FAILED", format!("索引状态不是有效 JSON：{e}")))?;
-    if value.get("initialized") == Some(&serde_json::Value::Bool(false)) {
+        .map_err(|e| AppError::new("INDEX_STATUS_FAILED", e))??;
+    let Some(stats) = stats else {
         return Ok("missing".into());
-    }
-    let bound = value
-        .get("projectPath")
-        .and_then(|v| v.as_str())
-        .and_then(|s| std::fs::canonicalize(s).ok());
-    if value.get("initialized").and_then(|v| v.as_bool()) != Some(true)
-        || value.pointer("/index/state").and_then(|v| v.as_str()) != Some("complete")
-        || bound != std::fs::canonicalize(&p.canonical_path).ok()
-    {
-        return Err(AppError::new(
-            "INDEX_NOT_READY",
-            "索引未完成，或索引项目路径不匹配",
-        ));
-    }
-    {
-        let mut snapshots = state.snapshots.lock().unwrap();
-        let s = snapshots
-            .entry(p.id.clone())
-            .or_insert_with(|| RuntimeSnapshot::new(&p.id));
-        s.index_stats = Some(
-            serde_json::json!({"fileCount":value.get("fileCount"),"nodeCount":value.get("nodeCount"),"edgeCount":value.get("edgeCount"),"checkedAt":now()}),
-        );
-    }
+    };
+    state
+        .snapshots
+        .lock()
+        .unwrap()
+        .entry(p.id.clone())
+        .or_insert_with(|| RuntimeSnapshot::new(&p.id))
+        .index_stats = Some(stats);
     Ok("ready".into())
 }
 pub async fn start<R: tauri::Runtime>(

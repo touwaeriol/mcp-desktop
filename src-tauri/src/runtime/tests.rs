@@ -426,7 +426,13 @@ impl Fixture {
         std::fs::create_dir_all(root.join(".codegraph")).unwrap();
         rusqlite::Connection::open(root.join(".codegraph/codegraph.db"))
             .unwrap()
-            .execute("CREATE TABLE nodes(id TEXT)", [])
+            .execute_batch(
+                "CREATE TABLE nodes(id TEXT);
+                CREATE TABLE files(path TEXT);
+                CREATE TABLE edges(id INTEGER);
+                CREATE TABLE project_metadata(key TEXT PRIMARY KEY, value TEXT);
+                INSERT INTO project_metadata VALUES('index_state', 'complete');",
+            )
             .unwrap();
         let root = persistence::canonical(&root.to_string_lossy()).unwrap();
         let project = Project {
@@ -566,6 +572,31 @@ async fn failed_recovery_can_be_retried_without_stale_registration() {
     fixture.start(&project.id).await.unwrap();
     fixture.assert_running(&project.id).await;
     fixture.stop(&project.id).await;
+}
+
+#[tokio::test]
+async fn index_status_does_not_require_cli_and_clears_stale_counts_on_failure() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    persistence::set_setting(
+        &fixture.state.db.lock().unwrap(),
+        "codegraphEntry",
+        &fixture.dir.path().join("missing-cli").to_string_lossy(),
+    )
+    .unwrap();
+    assert_eq!(status(&fixture.state, &project).await.unwrap(), "ready");
+    assert!(fixture.state.snapshot(&project.id).index_stats.is_some());
+    let db = rusqlite::Connection::open(
+        Path::new(&project.canonical_path).join(".codegraph/codegraph.db"),
+    )
+    .unwrap();
+    db.execute("UPDATE project_metadata SET value='indexing'", [])
+        .unwrap();
+    assert_eq!(
+        status(&fixture.state, &project).await.unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    assert!(fixture.state.snapshot(&project.id).index_stats.is_none());
 }
 
 #[tokio::test]
